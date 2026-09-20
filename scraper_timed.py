@@ -33,13 +33,13 @@ REGRAS
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
 
-FUSO_BR = timedelta(hours=-3)
+FUSO_BR = timezone(timedelta(hours=-3))
 TEMPO_LIMITE = 30          # segundos por requisição
 LOTE_GRAVACAO = 150        # células por escrita no Sheets
 
@@ -209,8 +209,9 @@ def main():
     timed.entrar(usuario, senha)
     print("Login no TIMED: ok.")
 
-    hoje = (datetime.utcnow() + FUSO_BR).replace(hour=0, minute=0, second=0, microsecond=0)
-    agora = (datetime.utcnow() + FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+    agora_br = datetime.now(FUSO_BR)
+    hoje = agora_br.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    agora = agora_br.strftime("%d/%m/%Y %H:%M:%S")
 
     celulas = []
     n_encontrados = n_zerados = n_sem_codigo = n_grupo_desconhecido = n_erros = 0
