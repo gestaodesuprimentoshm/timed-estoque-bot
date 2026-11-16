@@ -22,6 +22,13 @@ VARIÁVEIS DE AMBIENTE
     ABA_DESTINO         nome da aba de destino
     COLUNA_GRUPO        letra da coluna que diz o grupo do item (ex.: AH)
     SECOES_POR_GRUPO    "Grupo=SEÇÃO1|SEÇÃO2; Outro Grupo=SEÇÃO"
+    SIGCS_DB_URL        banco do SIGCS, usuário próprio deste robô    (secret, opcional)
+    SIGCS_UNIDADE       id da unidade no banco do SIGCS                (opcional)
+
+BANCO (Fase 4 da migração das planilhas para PostgreSQL)
+    Além da planilha, o robô grava as mesmas leituras no banco do SIGCS, de onde o site
+    lê. As duas gravações são independentes: se uma falhar, a outra acontece mesmo assim,
+    e o job termina em vermelho. Sem SIGCS_DB_URL, grava só a planilha.
 
 REGRAS
     - a busca usa o código da coluna A exatamente como está na planilha;
@@ -42,6 +49,13 @@ from google.oauth2.service_account import Credentials
 FUSO_BR = timezone(timedelta(hours=-3))
 TEMPO_LIMITE = 30          # segundos por requisição
 LOTE_GRAVACAO = 150        # células por escrita no Sheets
+
+# Grupo da coluna de grupo (sem acento, maiúsculas) -> grupo no banco do SIGCS
+GRUPOS_BANCO = {
+    "MEDICAMENTOS": "medicamentos",
+    "MATERIAL MEDICO HOSPITALAR": "material",
+    "ALMOXARIFADO CENTRAL": "almoxarifado",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,8 +198,14 @@ class Timed:
         return self._json(r)
 
 
+def sem_acento(texto):
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    from sigcs_banco import Banco
     base_url   = obrigatoria("TIMED_BASE_URL")
     usuario    = obrigatoria("TIMED_USER")
     senha      = obrigatoria("TIMED_PASS")
@@ -199,6 +219,25 @@ def main():
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     aba = gspread.authorize(credenciais).open_by_key(sheet_id).worksheet(nome_aba)
+
+    unidade = os.environ.get("SIGCS_UNIDADE", "").strip()
+    banco = Banco(publico=True)
+    if banco.ativo and not unidade:
+        print("[BANCO] SIGCS_UNIDADE não configurada: só a planilha será gravada.")
+        banco.url = ""
+    banco.iniciar()
+    leituras = []              # o que vai para o banco: grupo, código e valores de cada linha gravada
+    planilha = {"ok": True}
+
+    def enviar(celulas_lote):
+        """Grava um lote na planilha. Falhou uma vez, para de tentar e segue (o banco ainda recebe)."""
+        if not planilha["ok"]:
+            return
+        try:
+            aba.update_cells(celulas_lote)
+        except Exception as e:
+            planilha["ok"] = False
+            print(f"Falha ao gravar a planilha: {type(e).__name__}. O banco ainda será gravado.")
 
     codigos = aba.col_values(1)          # A — Cód. TIMED
     grupos  = aba.col_values(col_grupo)  # coluna de grupo
@@ -261,12 +300,33 @@ def main():
         ):
             celulas.append(gspread.Cell(row=linha, col=coluna, value=valor_celula))
 
+        grupo_banco = GRUPOS_BANCO.get(sem_acento(grupo))
+        if grupo_banco:
+            leituras.append({
+                "grupo": grupo_banco, "codigo": " ".join(codigo.split()), "estoque": estoque,
+                "consumo_mensal": consumo_ideal, "consumo_mes_corrente": consumo_mes,
+                "consumo_10_dias": consumo_10d, "valor_unitario": valor, "lido_em": agora_br.isoformat(),
+            })
+
         if len(celulas) >= LOTE_GRAVACAO:
-            aba.update_cells(celulas)
+            enviar(celulas)
             celulas.clear()
 
     if celulas:
-        aba.update_cells(celulas)
+        enviar(celulas)
+
+    # Banco: com nenhum item encontrado (credencial recusada, TIMED fora do ar), os zeros não
+    # vão para o banco — lá fica a leitura anterior, e o job termina em vermelho logo abaixo.
+    resultado = None
+    if n_encontrados > 0:
+        def gravar(con, execucao):
+            from psycopg.types.json import Jsonb
+            return con.execute("select sigcs.gravar_leituras(%s, %s, %s)",
+                               (unidade, Jsonb(leituras), execucao)).fetchone()[0]
+        resultado = banco.gravar(gravar)
+    mensagem = (f"{n_encontrados} encontrados, {n_zerados} zerados, {n_sem_codigo} sem código, {n_erros} erros"
+                + (f"; banco: {resultado['leituras']} leituras, {resultado['sem_par']} códigos sem par" if resultado else ""))
+    banco_ok = banco.finalizar(planilha["ok"], linhas=resultado["leituras"] if resultado else None, mensagem=mensagem)
 
     print("── Resumo ──")
     print(f"  encontrados no TIMED : {n_encontrados}")
@@ -274,11 +334,15 @@ def main():
     print(f"  sem código válido    : {n_sem_codigo}")
     print(f"  grupo não configurado: {n_grupo_desconhecido}")
     print(f"  erros de consulta    : {n_erros}")
+    if resultado:
+        print(f"  banco: {resultado['leituras']} leituras gravadas, {resultado['sem_par']} códigos sem par no banco")
 
     if n_encontrados == 0:
         # Falha silenciosa é o pior defeito possível num robô agendado:
         # aqui o job termina em vermelho, para o problema aparecer.
         raise SystemExit("Nenhum item encontrado no TIMED. Verifique credenciais e códigos.")
+    if not banco_ok:
+        raise SystemExit("A planilha ou o banco não foram gravados (ver as mensagens acima).")
 
 
 if __name__ == "__main__":

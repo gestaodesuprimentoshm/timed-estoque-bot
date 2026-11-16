@@ -8,8 +8,11 @@ variáveis de ambiente. Não há nenhum endereço ou identificador neste código
 
 ## Variáveis
 
-Secrets: `GOOGLE_CREDENTIALS`, `TIMED_BASE_URL`, `TIMED_USER`, `TIMED_PASS`, `SHEET_ID`
-Variables: `ABA_DESTINO`, `COLUNA_GRUPO`, `SECOES_POR_GRUPO`
+Secrets: `GOOGLE_CREDENTIALS`, `TIMED_BASE_URL`, `TIMED_USER`, `TIMED_PASS`, `SHEET_ID`, `SIGCS_DB_URL` (opcional)
+Variables: `ABA_DESTINO`, `COLUNA_GRUPO`, `SECOES_POR_GRUPO`, `SIGCS_UNIDADE` (opcional)
+
+Com `SIGCS_DB_URL` e `SIGCS_UNIDADE`, as leituras também são gravadas num banco PostgreSQL
+(função `gravar_leituras`), além da planilha.
 
 `SECOES_POR_GRUPO` tem o formato `Grupo=SEÇÃO|OUTRA SEÇÃO; Outro Grupo=SEÇÃO`.
 

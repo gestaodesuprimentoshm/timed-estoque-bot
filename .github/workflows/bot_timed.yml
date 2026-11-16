@@ -38,4 +38,7 @@ jobs:
           ABA_DESTINO:        ${{ vars.ABA_DESTINO }}
           COLUNA_GRUPO:       ${{ vars.COLUNA_GRUPO }}
           SECOES_POR_GRUPO:   ${{ vars.SECOES_POR_GRUPO }}
+          # Banco do SIGCS (Fase 4): usuário próprio deste robô. Sem o Secret, grava só a planilha.
+          SIGCS_DB_URL:       ${{ secrets.SIGCS_DB_URL }}
+          SIGCS_UNIDADE:      ${{ vars.SIGCS_UNIDADE }}
         run: python scraper_timed.py
