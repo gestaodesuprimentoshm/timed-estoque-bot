@@ -30,8 +30,14 @@ BANCO (Fase 4 da migração das planilhas para PostgreSQL)
     lê. As duas gravações são independentes: se uma falhar, a outra acontece mesmo assim,
     e o job termina em vermelho. Sem SIGCS_DB_URL, grava só a planilha.
 
+LISTA DE ITENS (Fase 5)
+    A lista de itens (grupo e código TIMED) vem do banco do SIGCS, onde é editada pela tela de
+    cadastro do site. Cada código é consultado uma vez; na planilha, recebem I–N as linhas cuja
+    coluna A tem o mesmo código no mesmo grupo. Sem banco (SIGCS_DB_URL ausente) ou com o banco
+    fora do ar, o robô usa a coluna A da planilha, como antes.
+
 REGRAS
-    - a busca usa o código da coluna A exatamente como está na planilha;
+    - a busca usa o código exatamente como está na lista (sem espaços);
     - item que o TIMED não encontrar fica com estoque, consumo e valor ZERO,
       e não com o valor antigo congelado;
     - o estoque soma apenas as seções configuradas para o grupo do item, e
@@ -198,6 +204,23 @@ class Timed:
         return self._json(r)
 
 
+def lista_do_banco(banco, unidade):
+    """Lista de itens do hospital no banco do SIGCS: [(grupo, código), ...] (Fase 5).
+
+    Desde a Fase 5 a lista é editada na tela de cadastro do SIGCS. Devolve None (e o robô usa
+    a coluna A da planilha, como antes) sem banco configurado ou se a leitura falhar.
+    """
+    if not banco.ativo or not unidade:
+        return None
+    try:
+        with banco._conectar() as con:
+            linhas = con.execute("select grupo, codigo from sigcs.itens_para_leitura(%s)", (unidade,)).fetchall()
+        return [(g, c or "") for g, c in linhas]
+    except Exception as e:
+        print(f"[BANCO] Lista de itens indisponível ({type(e).__name__}): usando a coluna A da planilha.")
+        return None
+
+
 def sem_acento(texto):
     import unicodedata
     return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
@@ -244,6 +267,11 @@ def main():
     total_linhas = max(len(codigos), len(grupos))
     print(f"Aba '{nome_aba}': {total_linhas - 1} linhas de dados.")
 
+    # Lista de itens: do banco (Fase 5: a lista é editada na tela de cadastro do SIGCS).
+    # Sem banco ou com o banco fora do ar, a coluna A da planilha, como antes.
+    lista = lista_do_banco(banco, unidade)
+    print(f"Lista de itens: {'banco do SIGCS (' + str(len(lista)) + ' códigos)' if lista is not None else 'coluna A da planilha'}.")
+
     timed = Timed(base_url)
     timed.entrar(usuario, senha)
     print("Login no TIMED: ok.")
@@ -253,64 +281,95 @@ def main():
     agora = agora_br.strftime("%d/%m/%Y %H:%M:%S")
 
     celulas = []
-    n_encontrados = n_zerados = n_sem_codigo = n_grupo_desconhecido = n_erros = 0
+    n = {"encontrados": 0, "zerados": 0, "sem_codigo": 0, "grupo_desconhecido": 0, "erros": 0, "fora_da_lista": 0}
 
-    for i in range(1, total_linhas):           # pula o cabeçalho
-        linha = i + 1
-        codigo = (codigos[i] if i < len(codigos) else "").strip()
-        grupo  = (grupos[i] if i < len(grupos) else "").strip().upper()
-
-        if not codigo and not grupo:
-            continue
-
-        # Código não numérico ("-", "s/ cadastro"): não adianta consultar
+    def consultar(codigo, secoes, rotulo):
+        """Valores de um código: (estoque, consumo ideal, consumo do mês, consumo 10 dias, valor), ou None se falhou."""
         if not codigo.isdigit():
-            n_sem_codigo += 1
-            estoque = consumo_ideal = consumo_mes = consumo_10d = 0
-            valor = 0.0
-        else:
-            secoes = por_grupo.get(grupo)
-            if secoes is None:
-                n_grupo_desconhecido += 1
-                continue                        # grupo fora da configuração: não mexe na linha
-            try:
-                produto_id = timed.buscar(codigo)
-                if produto_id is None:
-                    # Decisão do usuário: não encontrou, é zero — e não o valor antigo
-                    n_zerados += 1
-                    estoque = consumo_ideal = consumo_mes = consumo_10d = 0
-                    valor = 0.0
-                else:
-                    dados = timed.consumo(produto_id)
-                    estoque       = somar_estoque(timed.estoque(produto_id), secoes, hoje)
-                    consumo_ideal = consumo_mensal(dados)
-                    consumo_mes   = int(round(float(dados.get("consumoMesCorrente") or 0), 0))
-                    consumo_10d   = int(round(float(dados.get("consumoMedioDiario10Dias") or 0), 0))
-                    valor         = float(dados.get("valorUnitarioMedio") or 0)
-                    n_encontrados += 1
-            except Exception as e:
-                # Sem dado item a item no log: o repositório é público
-                n_erros += 1
-                print(f"[linha {linha}] falha na consulta: {type(e).__name__}")
-                continue
+            # Código não numérico ("-", "s/ cadastro"): não adianta consultar
+            n["sem_codigo"] += 1
+            return (0, 0, 0, 0, 0.0)
+        try:
+            produto_id = timed.buscar(codigo)
+            if produto_id is None:
+                # Decisão do usuário: não encontrou, é zero — e não o valor antigo
+                n["zerados"] += 1
+                return (0, 0, 0, 0, 0.0)
+            dados = timed.consumo(produto_id)
+            valores = (somar_estoque(timed.estoque(produto_id), secoes, hoje),
+                       consumo_mensal(dados),
+                       int(round(float(dados.get("consumoMesCorrente") or 0), 0)),
+                       int(round(float(dados.get("consumoMedioDiario10Dias") or 0), 0)),
+                       float(dados.get("valorUnitarioMedio") or 0))
+            n["encontrados"] += 1
+            return valores
+        except Exception as e:
+            # Sem dado item a item no log: o repositório é público
+            n["erros"] += 1
+            print(f"[{rotulo}] falha na consulta: {type(e).__name__}")
+            return None
 
-        for coluna, valor_celula in (
-            (9,  estoque), (10, consumo_ideal), (11, consumo_mes),
-            (12, consumo_10d), (13, valor), (14, agora),
-        ):
+    def gravar_linha(linha, valores):
+        nonlocal celulas
+        for coluna, valor_celula in zip((9, 10, 11, 12, 13), valores):
             celulas.append(gspread.Cell(row=linha, col=coluna, value=valor_celula))
-
-        grupo_banco = GRUPOS_BANCO.get(sem_acento(grupo))
-        if grupo_banco:
-            leituras.append({
-                "grupo": grupo_banco, "codigo": " ".join(codigo.split()), "estoque": estoque,
-                "consumo_mensal": consumo_ideal, "consumo_mes_corrente": consumo_mes,
-                "consumo_10_dias": consumo_10d, "valor_unitario": valor, "lido_em": agora_br.isoformat(),
-            })
-
+        celulas.append(gspread.Cell(row=linha, col=14, value=agora))
         if len(celulas) >= LOTE_GRAVACAO:
             enviar(celulas)
-            celulas.clear()
+            celulas = []
+
+    def leitura(grupo_banco, codigo, valores):
+        estoque, consumo_ideal, consumo_mes, consumo_10d, valor = valores
+        leituras.append({
+            "grupo": grupo_banco, "codigo": codigo, "estoque": estoque,
+            "consumo_mensal": consumo_ideal, "consumo_mes_corrente": consumo_mes,
+            "consumo_10_dias": consumo_10d, "valor_unitario": valor, "lido_em": agora_br.isoformat(),
+        })
+
+    if lista is not None:
+        # Cada código do banco é consultado uma vez; a planilha recebe I–N nas linhas cuja coluna A
+        # tem o mesmo código no mesmo grupo (até a Fase 6 ela continua sendo gravada).
+        secoes_banco = {GRUPOS_BANCO.get(sem_acento(nome)): secoes for nome, secoes in por_grupo.items()}
+        resultados = {}
+        for k, (grupo_banco, codigo) in enumerate(lista, start=1):
+            codigo = " ".join((codigo or "").split())
+            secoes = secoes_banco.get(grupo_banco)
+            if secoes is None:
+                n["grupo_desconhecido"] += 1
+                continue
+            valores = consultar(codigo, secoes, f"item {k}")
+            if valores is None:
+                continue
+            resultados[(grupo_banco, codigo)] = valores
+            leitura(grupo_banco, codigo, valores)
+        for i in range(1, total_linhas):           # pula o cabeçalho
+            codigo = " ".join((codigos[i] if i < len(codigos) else "").split())
+            grupo  = (grupos[i] if i < len(grupos) else "").strip().upper()
+            if not codigo and not grupo:
+                continue
+            valores = resultados.get((GRUPOS_BANCO.get(sem_acento(grupo)), codigo))
+            if valores is None:
+                n["fora_da_lista"] += 1           # linha da planilha que não está na lista do banco: não mexe
+                continue
+            gravar_linha(i + 1, valores)
+    else:
+        for i in range(1, total_linhas):           # pula o cabeçalho
+            linha = i + 1
+            codigo = (codigos[i] if i < len(codigos) else "").strip()
+            grupo  = (grupos[i] if i < len(grupos) else "").strip().upper()
+            if not codigo and not grupo:
+                continue
+            secoes = por_grupo.get(grupo)
+            if codigo.isdigit() and secoes is None:
+                n["grupo_desconhecido"] += 1
+                continue                        # grupo fora da configuração: não mexe na linha
+            valores = consultar(codigo, secoes, f"linha {linha}")
+            if valores is None:
+                continue
+            gravar_linha(linha, valores)
+            grupo_banco = GRUPOS_BANCO.get(sem_acento(grupo))
+            if grupo_banco:
+                leitura(grupo_banco, " ".join(codigo.split()), valores)
 
     if celulas:
         enviar(celulas)
@@ -318,26 +377,31 @@ def main():
     # Banco: com nenhum item encontrado (credencial recusada, TIMED fora do ar), os zeros não
     # vão para o banco — lá fica a leitura anterior, e o job termina em vermelho logo abaixo.
     resultado = None
-    if n_encontrados > 0:
+    if n["encontrados"] > 0:
         def gravar(con, execucao):
             from psycopg.types.json import Jsonb
             return con.execute("select sigcs.gravar_leituras(%s, %s, %s)",
                                (unidade, Jsonb(leituras), execucao)).fetchone()[0]
         resultado = banco.gravar(gravar)
-    mensagem = (f"{n_encontrados} encontrados, {n_zerados} zerados, {n_sem_codigo} sem código, {n_erros} erros"
+    mensagem = (f"lista: {'banco' if lista is not None else 'planilha'}; {n['encontrados']} encontrados, {n['zerados']} zerados, "
+                f"{n['sem_codigo']} sem código, {n['erros']} erros"
+                + (f", {n['fora_da_lista']} linhas da planilha fora da lista" if lista is not None else "")
                 + (f"; banco: {resultado['leituras']} leituras, {resultado['sem_par']} códigos sem par" if resultado else ""))
     banco_ok = banco.finalizar(planilha["ok"], linhas=resultado["leituras"] if resultado else None, mensagem=mensagem)
 
     print("── Resumo ──")
-    print(f"  encontrados no TIMED : {n_encontrados}")
-    print(f"  zerados (sem retorno): {n_zerados}")
-    print(f"  sem código válido    : {n_sem_codigo}")
-    print(f"  grupo não configurado: {n_grupo_desconhecido}")
-    print(f"  erros de consulta    : {n_erros}")
+    print(f"  lista de itens       : {'banco do SIGCS' if lista is not None else 'coluna A da planilha'}")
+    print(f"  encontrados no TIMED : {n['encontrados']}")
+    print(f"  zerados (sem retorno): {n['zerados']}")
+    print(f"  sem código válido    : {n['sem_codigo']}")
+    print(f"  grupo não configurado: {n['grupo_desconhecido']}")
+    print(f"  erros de consulta    : {n['erros']}")
+    if lista is not None:
+        print(f"  linhas da planilha fora da lista do banco (não gravadas): {n['fora_da_lista']}")
     if resultado:
         print(f"  banco: {resultado['leituras']} leituras gravadas, {resultado['sem_par']} códigos sem par no banco")
 
-    if n_encontrados == 0:
+    if n["encontrados"] == 0:
         # Falha silenciosa é o pior defeito possível num robô agendado:
         # aqui o job termina em vermelho, para o problema aparecer.
         raise SystemExit("Nenhum item encontrado no TIMED. Verifique credenciais e códigos.")
