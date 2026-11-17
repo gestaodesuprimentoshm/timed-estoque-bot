@@ -46,6 +46,7 @@ REGRAS
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import gspread
@@ -55,6 +56,11 @@ from google.oauth2.service_account import Credentials
 FUSO_BR = timezone(timedelta(hours=-3))
 TEMPO_LIMITE = 30          # segundos por requisição
 LOTE_GRAVACAO = 150        # células por escrita no Sheets
+# Com a lista do banco, a planilha é toda gravada no fim, de uma vez: lotes maiores e um intervalo
+# mínimo entre escritas, para não estourar a cota do Sheets (60 escritas por minuto). Em 17/11 os
+# ~65 lotes de 150 células saíram em segundos e o Google recusou (APIError).
+LOTE_GRAVACAO_BANCO = 1200
+INTERVALO_ESCRITAS = 1.2   # segundos
 
 # Grupo da coluna de grupo (sem acento, maiúsculas) -> grupo no banco do SIGCS
 GRUPOS_BANCO = {
@@ -250,17 +256,32 @@ def main():
         banco.url = ""
     banco.iniciar()
     leituras = []              # o que vai para o banco: grupo, código e valores de cada linha gravada
-    planilha = {"ok": True}
+    planilha = {"ok": True, "ultima": 0.0}
 
     def enviar(celulas_lote):
-        """Grava um lote na planilha. Falhou uma vez, para de tentar e segue (o banco ainda recebe)."""
+        """Grava um lote na planilha. Cota estourada (429) ou falha do Google (5xx): espera e tenta
+        de novo, até 3 vezes. Outra falha, ou as 3 tentativas esgotadas: para de tentar e segue
+        (o banco ainda recebe)."""
         if not planilha["ok"]:
             return
-        try:
-            aba.update_cells(celulas_lote)
-        except Exception as e:
-            planilha["ok"] = False
-            print(f"Falha ao gravar a planilha: {type(e).__name__}. O banco ainda será gravado.")
+        for tentativa in range(1, 4):
+            espera = INTERVALO_ESCRITAS - (time.monotonic() - planilha["ultima"])
+            if espera > 0:
+                time.sleep(espera)
+            try:
+                aba.update_cells(celulas_lote)
+                planilha["ultima"] = time.monotonic()
+                return
+            except Exception as e:
+                planilha["ultima"] = time.monotonic()
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if (status == 429 or (status or 0) >= 500) and tentativa < 3:
+                    print(f"Planilha recusou a escrita (HTTP {status}); nova tentativa em 65 s.")
+                    time.sleep(65)
+                    continue
+                planilha["ok"] = False
+                print(f"Falha ao gravar a planilha: {type(e).__name__} (HTTP {status}). O banco ainda será gravado.")
+                return
 
     codigos = aba.col_values(1)          # A — Cód. TIMED
     grupos  = aba.col_values(col_grupo)  # coluna de grupo
@@ -309,12 +330,12 @@ def main():
             print(f"[{rotulo}] falha na consulta: {type(e).__name__}")
             return None
 
-    def gravar_linha(linha, valores):
+    def gravar_linha(linha, valores, lote=LOTE_GRAVACAO):
         nonlocal celulas
         for coluna, valor_celula in zip((9, 10, 11, 12, 13), valores):
             celulas.append(gspread.Cell(row=linha, col=coluna, value=valor_celula))
         celulas.append(gspread.Cell(row=linha, col=14, value=agora))
-        if len(celulas) >= LOTE_GRAVACAO:
+        if len(celulas) >= lote:
             enviar(celulas)
             celulas = []
 
@@ -351,7 +372,7 @@ def main():
             if valores is None:
                 n["fora_da_lista"] += 1           # linha da planilha que não está na lista do banco: não mexe
                 continue
-            gravar_linha(i + 1, valores)
+            gravar_linha(i + 1, valores, LOTE_GRAVACAO_BANCO)
     else:
         for i in range(1, total_linhas):           # pula o cabeçalho
             linha = i + 1
