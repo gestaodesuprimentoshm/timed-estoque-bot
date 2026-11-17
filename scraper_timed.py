@@ -24,6 +24,7 @@ VARIÁVEIS DE AMBIENTE
     SECOES_POR_GRUPO    "Grupo=SEÇÃO1|SEÇÃO2; Outro Grupo=SEÇÃO"
     SIGCS_DB_URL        banco do SIGCS, usuário próprio deste robô    (secret, opcional)
     SIGCS_UNIDADE       id da unidade no banco do SIGCS                (opcional)
+    GRAVAR_PLANILHA     "nao" desliga a planilha (Fase 6); vazio ou outro valor: grava (opcional)
 
 BANCO (Fase 4 da migração das planilhas para PostgreSQL)
     Além da planilha, o robô grava as mesmas leituras no banco do SIGCS, de onde o site
@@ -35,6 +36,11 @@ LISTA DE ITENS (Fase 5)
     cadastro do site. Cada código é consultado uma vez; na planilha, recebem I–N as linhas cuja
     coluna A tem o mesmo código no mesmo grupo. Sem banco (SIGCS_DB_URL ausente) ou com o banco
     fora do ar, o robô usa a coluna A da planilha, como antes.
+
+PLANILHA DESLIGADA (Fase 6)
+    Com GRAVAR_PLANILHA=nao (variável do repositório), o robô nem abre a planilha: grava só no
+    banco, e a lista do banco passa a ser obrigatória (sem ela, termina em vermelho). Para voltar
+    a gravar a planilha, apagar a variável ou trocar o valor.
 
 REGRAS
     - a busca usa o código exatamente como está na lista (sem espaços);
@@ -73,6 +79,11 @@ GRUPOS_BANCO = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuração
 # ─────────────────────────────────────────────────────────────────────────────
+def planilha_ligada():
+    """Fase 6: GRAVAR_PLANILHA=nao desliga a gravação na planilha (vazio ou outro valor: grava)."""
+    return os.environ.get("GRAVAR_PLANILHA", "").strip().lower() not in ("nao", "não", "0", "false", "off", "desligada")
+
+
 def obrigatoria(nome):
     valor = os.environ.get(nome)
     if not valor:
@@ -238,22 +249,28 @@ def main():
     base_url   = obrigatoria("TIMED_BASE_URL")
     usuario    = obrigatoria("TIMED_USER")
     senha      = obrigatoria("TIMED_PASS")
-    sheet_id   = obrigatoria("SHEET_ID")
-    nome_aba   = obrigatoria("ABA_DESTINO")
-    col_grupo  = letra_para_indice(obrigatoria("COLUNA_GRUPO"))
     por_grupo  = ler_secoes_por_grupo(obrigatoria("SECOES_POR_GRUPO"))
-
-    credenciais = Credentials.from_service_account_info(
-        json.loads(obrigatoria("GOOGLE_CREDENTIALS")),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    aba = gspread.authorize(credenciais).open_by_key(sheet_id).worksheet(nome_aba)
+    gravar_pl  = planilha_ligada()
 
     unidade = os.environ.get("SIGCS_UNIDADE", "").strip()
     banco = Banco(publico=True)
     if banco.ativo and not unidade:
         print("[BANCO] SIGCS_UNIDADE não configurada: só a planilha será gravada.")
         banco.url = ""
+    if not gravar_pl and not banco.ativo:
+        raise SystemExit("Planilha desligada (GRAVAR_PLANILHA) e banco não configurado: não há onde gravar.")
+
+    aba = None
+    if gravar_pl:
+        nome_aba  = obrigatoria("ABA_DESTINO")
+        col_grupo = letra_para_indice(obrigatoria("COLUNA_GRUPO"))
+        credenciais = Credentials.from_service_account_info(
+            json.loads(obrigatoria("GOOGLE_CREDENTIALS")),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        aba = gspread.authorize(credenciais).open_by_key(obrigatoria("SHEET_ID")).worksheet(nome_aba)
+    else:
+        print("Planilha: desligada (GRAVAR_PLANILHA, Fase 6). Grava só no banco.")
     banco.iniciar()
     leituras = []              # o que vai para o banco: grupo, código e valores de cada linha gravada
     planilha = {"ok": True, "ultima": 0.0}
@@ -283,14 +300,21 @@ def main():
                 print(f"Falha ao gravar a planilha: {type(e).__name__} (HTTP {status}). O banco ainda será gravado.")
                 return
 
-    codigos = aba.col_values(1)          # A — Cód. TIMED
-    grupos  = aba.col_values(col_grupo)  # coluna de grupo
-    total_linhas = max(len(codigos), len(grupos))
-    print(f"Aba '{nome_aba}': {total_linhas - 1} linhas de dados.")
+    if gravar_pl:
+        codigos = aba.col_values(1)          # A — Cód. TIMED
+        grupos  = aba.col_values(col_grupo)  # coluna de grupo
+        total_linhas = max(len(codigos), len(grupos))
+        print(f"Aba '{nome_aba}': {total_linhas - 1} linhas de dados.")
+    else:
+        codigos, grupos, total_linhas = [], [], 0
 
     # Lista de itens: do banco (Fase 5: a lista é editada na tela de cadastro do SIGCS).
-    # Sem banco ou com o banco fora do ar, a coluna A da planilha, como antes.
+    # Sem banco ou com o banco fora do ar, a coluna A da planilha, como antes — exceto com a
+    # planilha desligada (Fase 6): aí a lista do banco é obrigatória.
     lista = lista_do_banco(banco, unidade)
+    if lista is None and not gravar_pl:
+        banco.finalizar(True, mensagem="lista de itens do banco indisponível; planilha desligada: nada lido")
+        raise SystemExit("Lista de itens do banco indisponível e planilha desligada: nada a ler.")
     print(f"Lista de itens: {'banco do SIGCS (' + str(len(lista)) + ' códigos)' if lista is not None else 'coluna A da planilha'}.")
 
     timed = Timed(base_url)
@@ -363,7 +387,7 @@ def main():
                 continue
             resultados[(grupo_banco, codigo)] = valores
             leitura(grupo_banco, codigo, valores)
-        for i in range(1, total_linhas):           # pula o cabeçalho
+        for i in range(1, total_linhas):           # pula o cabeçalho (sem planilha: nenhuma linha)
             codigo = " ".join((codigos[i] if i < len(codigos) else "").split())
             grupo  = (grupos[i] if i < len(grupos) else "").strip().upper()
             if not codigo and not grupo:
@@ -406,7 +430,8 @@ def main():
         resultado = banco.gravar(gravar)
     mensagem = (f"lista: {'banco' if lista is not None else 'planilha'}; {n['encontrados']} encontrados, {n['zerados']} zerados, "
                 f"{n['sem_codigo']} sem código, {n['erros']} erros"
-                + (f", {n['fora_da_lista']} linhas da planilha fora da lista" if lista is not None else "")
+                + (f", {n['fora_da_lista']} linhas da planilha fora da lista" if lista is not None and gravar_pl else "")
+                + ("; planilha: desligada (Fase 6)" if not gravar_pl else "")
                 + (f"; banco: {resultado['leituras']} leituras, {resultado['sem_par']} códigos sem par" if resultado else ""))
     banco_ok = banco.finalizar(planilha["ok"], linhas=resultado["leituras"] if resultado else None, mensagem=mensagem)
 
@@ -417,7 +442,9 @@ def main():
     print(f"  sem código válido    : {n['sem_codigo']}")
     print(f"  grupo não configurado: {n['grupo_desconhecido']}")
     print(f"  erros de consulta    : {n['erros']}")
-    if lista is not None:
+    if not gravar_pl:
+        print("  planilha             : desligada (Fase 6)")
+    elif lista is not None:
         print(f"  linhas da planilha fora da lista do banco (não gravadas): {n['fora_da_lista']}")
     if resultado:
         print(f"  banco: {resultado['leituras']} leituras gravadas, {resultado['sem_par']} códigos sem par no banco")

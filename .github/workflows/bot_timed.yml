@@ -41,4 +41,6 @@ jobs:
           # Banco do SIGCS (Fase 4): usuário próprio deste robô. Sem o Secret, grava só a planilha.
           SIGCS_DB_URL:       ${{ secrets.SIGCS_DB_URL }}
           SIGCS_UNIDADE:      ${{ vars.SIGCS_UNIDADE }}
+          # Fase 6: a variável GRAVAR_PLANILHA=nao desliga a planilha (o robô grava só no banco).
+          GRAVAR_PLANILHA:    ${{ vars.GRAVAR_PLANILHA }}
         run: python scraper_timed.py
