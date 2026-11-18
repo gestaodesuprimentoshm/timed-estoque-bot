@@ -48,6 +48,16 @@ REGRAS
       e não com o valor antigo congelado;
     - o estoque soma apenas as seções configuradas para o grupo do item, e
       apenas lotes dentro da validade.
+
+RESULTADO DA BUSCA NO BANCO
+    Cada leitura gravada em sigcs.leitura_estoque leva também resultado_busca (migração 010):
+    ok, lista_vazia, so_parecidos, resposta_invalida ou sem_codigo. É o que permite listar os
+    códigos que o hospital precisa ajustar no TIMED.
+
+DETALHE NO LOG
+    O resumo do fim do log e a mensagem da execução (sigcs.execucao) trazem, por grupo, quantos
+    códigos o TIMED achou (com dado ou sem movimento) e por que não achou o resto (lista vazia,
+    só parecidos, resposta inválida). Só contagens: o repositório é público.
 """
 
 import json
@@ -190,20 +200,27 @@ class Timed:
             raise ValueError("O TIMED devolveu a tela de login: credenciais recusadas.")
 
     def buscar(self, codigo):
-        """Devolve o id interno do produto, ou None.
+        """Devolve (id interno do produto ou None, motivo).
 
         Confere o codigoAuxiliar antes de aceitar, para não casar um item
         parecido quando a busca devolve mais de um resultado.
+
+        Motivo, quando não acha (só para o resumo do log; não muda o resultado):
+          "lista_vazia"        o TIMED não devolveu nenhum produto para o código;
+          "so_parecidos"       devolveu produtos, mas nenhum com esse codigoAuxiliar;
+          "resposta_invalida"  a resposta não era uma lista (sessão caída, erro do TIMED).
         """
         r = self.s.get(f"{self.base}/vitai/produto/produto.do", timeout=TEMPO_LIMITE,
                        params={"perform": "procurarPorNome", "pesquisa": codigo, "controle": "18"})
         achados = self._json(r)
-        if not isinstance(achados, list) or not achados:
-            return None
+        if not isinstance(achados, list):
+            return None, "resposta_invalida"
+        if not achados:
+            return None, "lista_vazia"
         for p in achados:
             if str(p.get("codigoAuxiliar", "")).strip() == codigo:
-                return p.get("id") or p.get("value")
-        return None
+                return (p.get("id") or p.get("value")), "ok"
+        return None, "so_parecidos"
 
     def consumo(self, produto_id):
         r = self.s.post(f"{self.base}/vitai/produto/avaliacaoConsumoCompra.do", timeout=TEMPO_LIMITE,
@@ -327,18 +344,35 @@ def main():
 
     celulas = []
     n = {"encontrados": 0, "zerados": 0, "sem_codigo": 0, "grupo_desconhecido": 0, "erros": 0, "fora_da_lista": 0}
+    # Detalhe por grupo, só contagens (o log do repositório público não leva dado item a item):
+    #   com_dado       achou no TIMED e há estoque, consumo ou valor;
+    #   achou_sem_mov  achou no TIMED, mas estoque, consumo e valor são zero (o zero é real);
+    #   lista_vazia / so_parecidos / resposta_invalida  não achou (ver Timed.buscar).
+    detalhe = {}
+    ultima_busca = {"resultado": None}   # resultado da última consulta, gravado junto com a leitura (migração 010)
 
-    def consultar(codigo, secoes, rotulo):
+    def contar(grupo, chave):
+        d = detalhe.setdefault(grupo or "?", {"total": 0, "com_dado": 0, "achou_sem_mov": 0, "lista_vazia": 0,
+                                              "so_parecidos": 0, "resposta_invalida": 0, "sem_codigo": 0})
+        d[chave] += 1
+
+    def consultar(codigo, secoes, rotulo, grupo=None):
         """Valores de um código: (estoque, consumo ideal, consumo do mês, consumo 10 dias, valor), ou None se falhou."""
+        contar(grupo, "total")
+        ultima_busca["resultado"] = None
         if not codigo.isdigit():
             # Código não numérico ("-", "s/ cadastro"): não adianta consultar
             n["sem_codigo"] += 1
+            contar(grupo, "sem_codigo")
+            ultima_busca["resultado"] = "sem_codigo"
             return (0, 0, 0, 0, 0.0)
         try:
-            produto_id = timed.buscar(codigo)
+            produto_id, motivo = timed.buscar(codigo)
             if produto_id is None:
                 # Decisão do usuário: não encontrou, é zero — e não o valor antigo
                 n["zerados"] += 1
+                contar(grupo, motivo)
+                ultima_busca["resultado"] = motivo
                 return (0, 0, 0, 0, 0.0)
             dados = timed.consumo(produto_id)
             valores = (somar_estoque(timed.estoque(produto_id), secoes, hoje),
@@ -347,6 +381,8 @@ def main():
                        int(round(float(dados.get("consumoMedioDiario10Dias") or 0), 0)),
                        float(dados.get("valorUnitarioMedio") or 0))
             n["encontrados"] += 1
+            contar(grupo, "com_dado" if any(valores) else "achou_sem_mov")
+            ultima_busca["resultado"] = "ok"
             return valores
         except Exception as e:
             # Sem dado item a item no log: o repositório é público
@@ -369,6 +405,7 @@ def main():
             "grupo": grupo_banco, "codigo": codigo, "estoque": estoque,
             "consumo_mensal": consumo_ideal, "consumo_mes_corrente": consumo_mes,
             "consumo_10_dias": consumo_10d, "valor_unitario": valor, "lido_em": agora_br.isoformat(),
+            "resultado_busca": ultima_busca["resultado"],
         })
 
     if lista is not None:
@@ -382,7 +419,7 @@ def main():
             if secoes is None:
                 n["grupo_desconhecido"] += 1
                 continue
-            valores = consultar(codigo, secoes, f"item {k}")
+            valores = consultar(codigo, secoes, f"item {k}", grupo_banco)
             if valores is None:
                 continue
             resultados[(grupo_banco, codigo)] = valores
@@ -408,7 +445,7 @@ def main():
             if codigo.isdigit() and secoes is None:
                 n["grupo_desconhecido"] += 1
                 continue                        # grupo fora da configuração: não mexe na linha
-            valores = consultar(codigo, secoes, f"linha {linha}")
+            valores = consultar(codigo, secoes, f"linha {linha}", GRUPOS_BANCO.get(sem_acento(grupo)) or grupo)
             if valores is None:
                 continue
             gravar_linha(linha, valores)
@@ -428,11 +465,19 @@ def main():
             return con.execute("select sigcs.gravar_leituras(%s, %s, %s)",
                                (unidade, Jsonb(leituras), execucao)).fetchone()[0]
         resultado = banco.gravar(gravar)
+    def texto_detalhe(g, d):
+        """Uma linha por grupo: quantos códigos o TIMED achou (com dado ou sem movimento) e por que não achou o resto."""
+        nao_achou = d["lista_vazia"] + d["so_parecidos"] + d["resposta_invalida"]
+        return (f"{g} {d['total']} códigos: {d['com_dado']} com dado, {d['achou_sem_mov']} achados sem movimento, "
+                f"{nao_achou} não achados ({d['lista_vazia']} lista vazia, {d['so_parecidos']} só parecidos, "
+                f"{d['resposta_invalida']} resposta inválida), {d['sem_codigo']} sem código")
+
     mensagem = (f"lista: {'banco' if lista is not None else 'planilha'}; {n['encontrados']} encontrados, {n['zerados']} zerados, "
                 f"{n['sem_codigo']} sem código, {n['erros']} erros"
                 + (f", {n['fora_da_lista']} linhas da planilha fora da lista" if lista is not None and gravar_pl else "")
                 + ("; planilha: desligada (Fase 6)" if not gravar_pl else "")
-                + (f"; banco: {resultado['leituras']} leituras, {resultado['sem_par']} códigos sem par" if resultado else ""))
+                + (f"; banco: {resultado['leituras']} leituras, {resultado['sem_par']} códigos sem par" if resultado else "")
+                + ("; detalhe: " + " | ".join(texto_detalhe(g, d) for g, d in sorted(detalhe.items())) if detalhe else ""))
     banco_ok = banco.finalizar(planilha["ok"], linhas=resultado["leituras"] if resultado else None, mensagem=mensagem)
 
     print("── Resumo ──")
@@ -442,6 +487,10 @@ def main():
     print(f"  sem código válido    : {n['sem_codigo']}")
     print(f"  grupo não configurado: {n['grupo_desconhecido']}")
     print(f"  erros de consulta    : {n['erros']}")
+    if detalhe:
+        print("── Detalhe por grupo (só contagens) ──")
+        for g, d in sorted(detalhe.items()):
+            print(f"  {texto_detalhe(g, d)}")
     if not gravar_pl:
         print("  planilha             : desligada (Fase 6)")
     elif lista is not None:
